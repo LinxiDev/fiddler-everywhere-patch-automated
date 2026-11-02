@@ -102,6 +102,84 @@ try {
   } catch (e) {
     console.error('[fe-patch] hosts setup failed:', e)
   }
+
+  // 3) Diagnostics: record what the local server answers so a stuck start can be
+  //    diagnosed from a single file. Responses without a Signature header mean
+  //    the mock file tree has no template for that endpoint, which leaves the
+  //    UI waiting on data it never receives.
+  try {
+    const __dFs = require('fs')
+    const __dOs = require('os')
+    const __dPath = require('path')
+    const __electron = __feElectron
+
+    let __logPath = ''
+    try {
+      __logPath = __dPath.join(__electron.app.getPath('userData'), 'fe-patch.log')
+    } catch (e) {
+      __logPath = __dPath.join(__dOs.tmpdir(), 'fe-patch.log')
+    }
+
+    const __log = function (message) {
+      const line = '[' + new Date().toISOString() + '] ' + message + '\n'
+      try {
+        __dFs.appendFileSync(__logPath, line)
+      } catch (e) { /* logging must never break startup */ }
+      console.info('[fe-patch] ' + message)
+    }
+
+    __log('log opened: ' + __logPath)
+    __log('version: ' + (__electron.app.getVersion ? __electron.app.getVersion() : 'unknown'))
+    __log('execPath: ' + process.execPath)
+
+    const __http = require('http')
+    const __origCreateServer = __http.createServer
+    __http.createServer = function () {
+      const server = __origCreateServer.apply(this, arguments)
+      server.on('request', function (req, res) {
+        const target = req.method + ' ' + (req.headers.host || '') + (req.url || '')
+        res.on('finish', function () {
+          try {
+            const signed = !!(res.getHeader && res.getHeader('signature'))
+            if (!signed && res.statusCode === 200) {
+              __log('[endpoint-miss] ' + target + ' -> no signature (no template)')
+            }
+          } catch (e) { /* ignore */ }
+        })
+      })
+      return server
+    }
+
+    // Mirror the backend process output into the diagnostics log. The backend
+    // reports authorization and signature problems on stderr, and those lines
+    // never reach the application log file.
+    const __cp = require('child_process')
+    const __origSpawn = __cp.spawn
+    __cp.spawn = function (command) {
+      const child = __origSpawn.apply(this, arguments)
+      try {
+        if (String(command).indexOf('Fiddler.WebUi') !== -1) {
+          __log('[spawn] ' + command + ' ' + JSON.stringify([].slice.call(arguments[1] || [])))
+          if (child.stdout) {
+            child.stdout.on('data', function (chunk) {
+              __log('[backend:out] ' + String(chunk).trim())
+            })
+          }
+          if (child.stderr) {
+            child.stderr.on('data', function (chunk) {
+              __log('[backend:err] ' + String(chunk).trim())
+            })
+          }
+          child.on('exit', function (code, signal) {
+            __log('[backend:exit] code=' + code + ' signal=' + signal)
+          })
+        }
+      } catch (e) { /* ignore */ }
+      return child
+    }
+  } catch (e) {
+    console.error('[fe-patch] diagnostics setup failed:', e)
+  }
 } catch (e) {
   console.error('[fe-patch] runtime hooks failed:', e)
 }

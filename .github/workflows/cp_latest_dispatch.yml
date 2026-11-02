@@ -754,6 +754,74 @@ jobs:
             Write-Host "msojocs-patch Folder not found"
           }
 
+      # Assert that every patch actually landed in the artifact. A silently
+      # skipped step produces a package that starts but never finishes loading.
+      - name: Verify patched artifact
+        run: |
+          $out = "FE/resources/app/out"
+          $failures = New-Object System.Collections.Generic.List[string]
+
+          function Assert-Path([string]$path, [string]$label) {
+            if (Test-Path $path) { Write-Host "OK   $label" }
+            else { $script:failures.Add("missing $label ($path)") }
+          }
+
+          Assert-Path "$out/main.js" "main.js"
+          Assert-Path "$out/main.original.js" "main.original.js"
+          Assert-Path "$out/file/identity.getfiddler.com/oauth/token.json" "mock token.json"
+          Assert-Path "$out/file/api.getfiddler.com/users/sign-in.json" "mock sign-in.json"
+          Assert-Path "$out/file/api.getfiddler.com/versions.json" "mock versions.json"
+          Assert-Path "$out/services/lib/preload.js" "stock preload"
+          Assert-Path "$out/WebServer/Fiddler.WebUi.dll" "Fiddler.WebUi.dll"
+          Assert-Path "$out/WebServer/System.Linq.dll" "System.Linq.dll"
+
+          $main = Get-Content -LiteralPath "$out/main.js" -Raw
+          if ($main -match ('const port = ' + [regex]::Escape($env:PATCH_SERVER_PORT) + ';')) {
+            Write-Host "OK   main.js uses port $env:PATCH_SERVER_PORT"
+          } else {
+            $failures.Add("main.js does not use port $env:PATCH_SERVER_PORT")
+          }
+          if ($main.Contains('[fe-patch]')) { Write-Host "OK   runtime hooks present" }
+          else { $failures.Add("runtime hooks not found in main.js") }
+
+          if (startsWith(env.PATCH_LANGUAGE, 'Yes')) {
+            Assert-Path "$out/translate.js" "translate.js (Chinese UI)"
+          }
+
+          $patchingVersion = $env:SCRAPED_VERSION
+          if (-not [string]::IsNullOrEmpty($patchingVersion) -and [version]$patchingVersion -ge [version]"8.0.0") {
+            if (Test-Path "$out/WebServer/Fiddler.WebUi.dll.bak-integrity") {
+              Write-Host "OK   Fiddler.WebUi.dll integrity patch applied"
+            } else {
+              $failures.Add("Fiddler.WebUi.dll was not patched (no .bak-integrity backup)")
+            }
+
+            $linq = Get-Item "$out/WebServer/System.Linq.dll"
+            if ($linq.Length -gt 150000 -and $linq.Length -lt 230000) {
+              Write-Host "OK   System.Linq.dll replaced ($($linq.Length) bytes)"
+            } else {
+              $failures.Add("System.Linq.dll does not look patched ($($linq.Length) bytes)")
+            }
+
+            $bundle = Get-ChildItem -Path "$out/WebServer/ClientApp/dist" -Filter "main-*.js" -File | Select-Object -First 1
+            if ($bundle) {
+              $content = Get-Content -LiteralPath $bundle.FullName -Raw
+              if ($content.Contains('if(!1)throw new Error("Signature verification failed!")')) {
+                Write-Host "OK   frontend signature check patched"
+              } else {
+                $failures.Add("frontend signature check not patched in $($bundle.Name)")
+              }
+            } else {
+              $failures.Add("Angular bundle main-*.js not found")
+            }
+          }
+
+          if ($failures.Count -gt 0) {
+            $failures | ForEach-Object { Write-Host "FAIL $_" }
+            throw "Artifact verification failed with $($failures.Count) problem(s)"
+          }
+          Write-Host "All patch checks passed"
+
       - name: Rename FE 
         id: rename-fe
         run: |
