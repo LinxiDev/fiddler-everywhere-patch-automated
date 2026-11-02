@@ -177,6 +177,40 @@ try {
       } catch (e) { /* ignore */ }
       return child
     }
+
+    // Mirror renderer console output. The Angular app logs most of its state
+    // through its own logger, but load and bootstrap failures only reach the
+    // DevTools console, which is not available while the UI is stuck.
+    try {
+      __electron.app.on('web-contents-created', function (_event, contents) {
+        contents.on('console-message', function () {
+          // Electron < 36 passes positional args, newer versions an object.
+          const args = [].slice.call(arguments)
+          let level = ''
+          let message = ''
+          if (args[1] && typeof args[1] === 'object') {
+            level = args[1].level || ''
+            message = args[1].message || ''
+          } else {
+            level = args[1]
+            message = args[2]
+          }
+          if (!message) return
+          if (String(level) === 'error' || String(level) === 'warning' || String(level) === '3' || String(level) === '2') {
+            __log('[renderer:' + level + '] ' + String(message).substring(0, 800))
+          }
+        })
+        contents.on('did-fail-load', function (_e, code, description, url, isMainFrame) {
+          __log('[renderer:did-fail-load] ' + code + ' ' + description + ' ' + url + ' mainFrame=' + isMainFrame)
+        })
+        contents.on('render-process-gone', function (_e, details) {
+          __log('[renderer:gone] ' + JSON.stringify(details))
+        })
+        contents.on('preload-error', function (_e, preloadPath, error) {
+          __log('[renderer:preload-error] ' + preloadPath + ' ' + (error && error.message))
+        })
+      })
+    } catch (e) { /* ignore */ }
   } catch (e) {
     console.error('[fe-patch] diagnostics setup failed:', e)
   }
