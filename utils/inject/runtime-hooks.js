@@ -4,12 +4,18 @@
 // line, and the resulting file becomes resources/app/out/main.js. It runs in the
 // Electron main process before the original application code.
 //
-// It fixes three things that a portable (installer-less) FE 8.x package needs:
+// It handles name resolution only: FE 8.x rewrites its API endpoints to
+// http://api.getfiddler.be:<port> and http://identity.getfiddler.be:<port>, and
+// those hostnames have real public DNS records. Both the renderer and the .NET
+// backend must therefore be redirected to the local server.
 //
-// 1. Chromium DNS override so the renderer reaches the local API server.
-// 2. System hosts entries so the .NET backend process does the same. The backend
-//    resolves DNS through the OS, so the Chromium switch above cannot help it.
-// 3. A bypass for the baked-in ECDSA public key whitelist of the Angular bundle.
+//   * renderer -> Chromium host-resolver-rules switch
+//   * backend  -> system hosts entries (the .NET process resolves DNS itself,
+//                 so the Chromium switch has no effect on it)
+//
+// Frontend response signature verification is neutralised at build time by
+// patching the Angular bundle, see the "Patch FE 8.x frontend signature checks"
+// workflow step.
 
 try {
   const __feElectron = require('electron')
@@ -95,39 +101,6 @@ try {
     }
   } catch (e) {
     console.error('[fe-patch] hosts setup failed:', e)
-  }
-
-  // 3) Angular bundle whitelist bypass.
-  //
-  //    The renderer verifies every signed response against three hardcoded ECDSA
-  //    public keys, while server/index.js signs them with a key generated at
-  //    runtime, so the lookup always fails. All P-256 SPKI keys start with
-  //    30 59 30 13 (48, 89, 48, 19); treat any such key as whitelisted.
-  const __somePatch = '(function(){try{' +
-    'if(Array.prototype.__feSomePatch)return;' +
-    'var original=Array.prototype.some;' +
-    'Array.prototype.some=function(callback,thisArg){' +
-    'return original.call(this,function(value,index,array){' +
-    'try{if(value&&value.length>=4&&value[0]===48&&value[1]===89&&value[2]===48&&value[3]===19)return true}catch(e){}' +
-    'return callback.call(thisArg,value,index,array)' +
-    '},thisArg)};' +
-    'Array.prototype.__feSomePatch=true;' +
-    '}catch(e){}})();'
-
-  try {
-    __feApp.on('web-contents-created', function (_event, contents) {
-      // dom-ready fires before the Angular bootstrap runs the first signed
-      // request; did-finish-load is kept as a fallback (the patch is idempotent).
-      contents.on('dom-ready', function () {
-        contents.executeJavaScript(__somePatch).catch(function () {})
-      })
-      contents.on('did-finish-load', function () {
-        contents.executeJavaScript(__somePatch).catch(function () {})
-      })
-    })
-    console.info('[fe-patch] frontend signature whitelist bypass registered')
-  } catch (e) {
-    console.error('[fe-patch] whitelist bypass failed:', e)
   }
 } catch (e) {
   console.error('[fe-patch] runtime hooks failed:', e)

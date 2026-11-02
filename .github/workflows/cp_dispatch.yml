@@ -638,6 +638,63 @@ jobs:
           python -m pip install --disable-pip-version-check --no-input dnfile
           python "utils/patch_integrity_check.py" $dll
 
+      # The Angular bundle verifies every signed response against three hardcoded
+      # ECDSA public keys, while server/index.js signs with a key generated at
+      # runtime. The lookup therefore always fails and every signed endpoint
+      # (e.g. /versions) is rejected with "Signature verification failed!".
+      # Rewriting the whitelist result to a constant neutralises that check while
+      # keeping the surrounding response parsing intact.
+      - name: Patch FE 8.x frontend signature checks
+        run: |
+          $patchingVersion = $env:VERSION_TO_PATCH
+          if ([string]::IsNullOrEmpty($patchingVersion) -or [version]$patchingVersion -lt [version]"8.0.0") {
+            Write-Host "FE version $patchingVersion is below 8.0.0; skipping frontend signature patch"
+            exit 0
+          }
+
+          $dist = "FE/resources/app/out/WebServer/ClientApp/dist"
+          if (-not (Test-Path $dist)) {
+            throw "Angular bundle directory not found: $dist"
+          }
+
+          $bundles = @(Get-ChildItem -Path $dist -Filter "main-*.js" -File)
+          if ($bundles.Count -eq 0) {
+            throw "No main-*.js bundle found in $dist"
+          }
+
+          $pattern = 'if\(![A-Za-z_$][\w$]*\)throw new Error\("Signature verification failed!"\)'
+          $replacement = 'if(!1)throw new Error("Signature verification failed!")'
+          $patchedBundles = 0
+
+          foreach ($bundle in $bundles) {
+            $content = Get-Content -LiteralPath $bundle.FullName -Raw
+
+            if ($content.Contains($replacement)) {
+              Write-Host "Already patched: $($bundle.Name)"
+              continue
+            }
+
+            $count = ([regex]::Matches($content, $pattern)).Count
+            if ($count -eq 0) {
+              if ($content.Contains('Signature verification failed!')) {
+                throw "Signature check found but pattern did not match in $($bundle.Name)"
+              }
+              Write-Host "No frontend signature check in $($bundle.Name); nothing to patch"
+              continue
+            }
+
+            $patched = [regex]::Replace($content, $pattern, $replacement)
+            Set-Content -LiteralPath $bundle.FullName -Value $patched -NoNewline -Encoding utf8NoBOM
+            Write-Host "Patched $count signature check(s) in $($bundle.Name)"
+            $patchedBundles++
+          }
+
+          if ($patchedBundles -eq 0) {
+            Write-Host "WARNING: no bundle was modified; verify the signature check manually"
+          } else {
+            Write-Host "Frontend signature checks patched in $patchedBundles bundle(s)"
+          }
+
       # FE 8.x validates the ECDSA public key of every signed API response
       # against a built-in whitelist (FiddlerBackendSDK -> Enumerable.Any).
       # The local server signs responses with a runtime generated key, so the
