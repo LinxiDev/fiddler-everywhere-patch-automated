@@ -485,6 +485,13 @@ jobs:
             throw "Neither resources/app.asar nor resources/app/out/main.js was found"
           }
 
+          $preloadPath = Join-Path $appDir "out/services/lib/preload.js"
+          if (Test-Path $preloadPath) {
+            Write-Host "Electron preload found: $preloadPath"
+          } else {
+            Write-Host "WARNING: Electron preload not found at $preloadPath"
+          }
+
       - name: Copy Server Folder
         run: |
           $source_server_folder = "msojocs-patch/server/file"
@@ -510,13 +517,39 @@ jobs:
         run: |
           $translate_js = "msojocs-patch/server/translate.js"
           $dest_translate = "FE/resources/app/out/translate.js"
+          $stock_preload = "FE/resources/app/out/services/lib/preload.js"
 
-          if (Test-Path $translate_js) {
-            Copy-Item -Path $translate_js -Destination $dest_translate -Force
-            Write-Host "translate.js copied, Chinese language enabled (Ctrl+T to switch)"
-          } else {
-            Write-Host "translate.js not found in server directory"
+          if (-not (Test-Path $translate_js)) {
+            throw "translate.js not found: $translate_js"
           }
+
+          if (-not (Test-Path $stock_preload)) {
+            Write-Host "Stock preload not found at $stock_preload; copying translate.js as-is"
+            Copy-Item -Path $translate_js -Destination $dest_translate -Force
+            exit 0
+          }
+
+          # server/index.js replaces webPreferences.preload with translate.js.
+          # translate.js is an old style preload: it assigns
+          # window.ipc = ipcRenderer and relies on process.once("loaded").
+          # FE 8.x keeps Electron's default contextIsolation/sandbox, so window.ipc
+          # never reaches the page and the UI aborts with
+          # "Fiddler Everywhere must be run inside its Electron application shell."
+          #
+          # Build a combined preload: the stock preload (contextBridge -> window.ipc)
+          # runs first, then the translation logic in its own guarded scope.
+          $stock_content = Get-Content -Path $stock_preload -Raw
+          $translate_content = Get-Content -Path $translate_js -Raw
+          $nl = [Environment]::NewLine
+          $once_shim = "try{if(typeof process==='object'&&typeof process.once!=='function'){Object.defineProperty(process,'once',{value:function(_e,fn){try{fn()}catch(_){}},configurable:!0});}}catch(e){}"
+
+          $combined = ";(function(){" + $nl + $stock_content + $nl + "})();" + $nl +
+                      $once_shim + $nl +
+                      ";(function(){try{" + $nl + $translate_content + $nl +
+                      "}catch(e){try{require('electron').ipcRenderer.send('preload-script-error','translate.js: '+e.message);}catch(_){}}})();" + $nl
+
+          Set-Content -Path $dest_translate -Value $combined -Encoding utf8NoBOM
+          Write-Host "Combined preload written to $dest_translate (Chinese language enabled, Ctrl+T to switch)"
 
       - name: Set patch server port (in main.js of server)
         run: |
