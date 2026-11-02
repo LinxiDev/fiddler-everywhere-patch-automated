@@ -132,14 +132,20 @@ try {
       const server = __origCreateServer.apply(this, arguments)
       server.on('request', function (req, res) {
         const target = req.method + ' ' + (req.headers.host || '') + (req.url || '')
-        res.on('finish', function () {
+
+        // Only the mock server answers with the literal body "not implement";
+        // legitimate non JSON replies (the OAuth HTML pages, favicon, or the
+        // app's own callback listener) must not be reported as misses.
+        const __origEnd = res.end
+        res.end = function (chunk) {
           try {
-            const signed = !!(res.getHeader && res.getHeader('signature'))
-            if (!signed && res.statusCode === 200) {
-              __log('[endpoint-miss] ' + target + ' -> no signature (no template)')
+            const body = chunk ? String(chunk) : ''
+            if (body === 'not implement') {
+              __log('[endpoint-miss] ' + target)
             }
           } catch (e) { /* ignore */ }
-        })
+          return __origEnd.apply(this, arguments)
+        }
       })
       return server
     }

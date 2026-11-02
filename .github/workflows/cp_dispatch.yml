@@ -526,6 +526,17 @@ jobs:
           Copy-Item -Path $source_server_folder -Destination $destination_server_folder -Recurse
           Write-Host "Copied $source_server_folder to $target_server_folder"
 
+          # The sign-in dialog probes three endpoints for connectivity and parses
+          # all of them as JSON. /oauth/jwks.json has no upstream template, so the
+          # server answered "not implement" and JSON.parse threw
+          # "Unexpected token 'o'". The frontend only needs a valid JSON body
+          # here (it reads the keys property), it is never used for verification.
+          $jwks = Join-Path $target_server_folder "identity.getfiddler.com/oauth/jwks.json"
+          if (-not (Test-Path $jwks)) {
+            Set-Content -LiteralPath $jwks -Value '{"keys":[]}' -Encoding utf8NoBOM
+            Write-Host "Added missing mock: $jwks"
+          }
+
       - name: Enable Chinese translation
         if: startsWith(env.PATCH_LANGUAGE, 'Yes')
         run: |
@@ -773,6 +784,7 @@ jobs:
           Assert-Path "$out/main.js" "main.js"
           Assert-Path "$out/main.original.js" "main.original.js"
           Assert-Path "$out/file/identity.getfiddler.com/oauth/token.json" "mock token.json"
+          Assert-Path "$out/file/identity.getfiddler.com/oauth/jwks.json" "mock jwks.json"
           Assert-Path "$out/file/api.getfiddler.com/users/sign-in.json" "mock sign-in.json"
           Assert-Path "$out/file/api.getfiddler.com/versions.json" "mock versions.json"
           Assert-Path "$out/services/lib/preload.js" "stock preload"
