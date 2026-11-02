@@ -550,14 +550,51 @@ jobs:
             throw "server/index.js not found: $source_index"
           }
 
-          $index_content = Get-Content -Path $source_index -Raw
+          $lines = Get-Content -Path $source_index
           $port_pattern = 'const port = \d+;'
-          if (-not [regex]::IsMatch($index_content, $port_pattern)) {
+          if (-not ($lines -match $port_pattern)) {
             throw "Could not find the port declaration in $source_index"
           }
-          $index_content = $index_content -replace $port_pattern, "const port = $env:PATCH_SERVER_PORT;"
-          Set-Content -Path $source_index -Value $index_content
+
+          # FE 8.x rewrites the UI endpoints to http://api.getfiddler.be:<port>
+          # and http://identity.getfiddler.be:<port>. Those hostnames resolve to
+          # real CloudFront addresses, so without a redirect the requests leave
+          # the machine and the UI stays on the loading screen. Upstream solves
+          # this by editing the system hosts file; Chromium's host resolver rules
+          # achieve the same thing without administrator rights.
+          $host_routing = @(
+            '',
+            '// ---- injected: resolve .be API hosts to the local server without touching system hosts ----',
+            'try {',
+            '  const { app: __feApp } = require("electron")',
+            '  const __feHostRules = "MAP api.getfiddler.be 127.0.0.1, MAP identity.getfiddler.be 127.0.0.1"',
+            '  if (__feApp && typeof __feApp.commandLine?.appendSwitch === "function") {',
+            '    __feApp.commandLine.appendSwitch("host-resolver-rules", __feHostRules)',
+            '    console.info("host-resolver-rules applied:", __feHostRules)',
+            '  }',
+            '} catch (e) { console.error("host-resolver-rules failed:", e) }'
+          )
+
+          $output = New-Object System.Collections.Generic.List[string]
+          $port_written = $false
+          $routing_written = $false
+
+          foreach ($line in $lines) {
+            if (-not $port_written -and $line -match '^const port = \d+;$') {
+              $output.Add("const port = $env:PATCH_SERVER_PORT;")
+              $port_written = $true
+              if (-not $routing_written) {
+                foreach ($injected in $host_routing) { $output.Add($injected) }
+                $routing_written = $true
+              }
+              continue
+            }
+            $output.Add($line)
+          }
+
+          Set-Content -Path $source_index -Value $output -Encoding utf8NoBOM
           Write-Host "Server port set to $env:PATCH_SERVER_PORT"
+          Write-Host "Injected host-resolver-rules for api/identity .be domains"
 
       - name: Set user credentials
         run: |
