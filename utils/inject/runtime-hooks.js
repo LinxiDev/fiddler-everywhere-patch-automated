@@ -33,11 +33,15 @@ try {
   }
 
   // 2) Backend side: the .NET process only sees the system hosts file.
+  //
+  //    Writing that file needs administrator rights, and requesting elevation
+  //    from inside the app would pop up UAC and a console window on every
+  //    launch. Instead only write when the current process can already do it
+  //    (the app was started elevated); otherwise point at the bundled
+  //    install-hosts.cmd, which the user runs once.
   try {
     const __fs = require('fs')
-    const __os = require('os')
     const __path = require('path')
-    const __cp = require('child_process')
     const __domains = ['api.getfiddler.be', 'identity.getfiddler.be']
     const __hostsPath = process.platform === 'win32'
       ? __path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts')
@@ -59,44 +63,34 @@ try {
 
     if (!__missing.length) {
       console.info('[fe-patch] hosts entries already present')
-    } else if (process.platform === 'win32') {
-      // Writing the hosts file requires elevation. Generate a script and run it
-      // through UAC once; later launches see the entries and stay silent.
-      const __scriptPath = __path.join(__os.tmpdir(), 'fe-patch-hosts.ps1')
-      const __psLines = __missing.map(function (domain) {
-        return "'127.0.0.1 " + domain + "'"
-      })
-      __fs.writeFileSync(
-        __scriptPath,
-        "$ErrorActionPreference='Stop'\r\n" +
-          "Add-Content -LiteralPath '" + __hostsPath + "' -Encoding ascii -Value (" +
-          "[Environment]::NewLine + '# fiddler-everywhere-enhance' + " +
-          __psLines.join(' + [Environment]::NewLine + ') +
-          " + [Environment]::NewLine)\r\n",
-        'utf8'
-      )
-      try {
-        __cp.execFileSync(
-          'powershell',
-          ['-NoProfile', '-Command',
-            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden " +
-            "-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + __scriptPath + "')"],
-          { stdio: 'ignore' }
-        )
-        console.info('[fe-patch] hosts patched (elevated)')
-      } catch (e) {
-        console.error('[fe-patch] hosts elevation failed; add manually: ' + __missing.join(', '))
-      }
     } else {
+      let __written = false
       try {
         __fs.appendFileSync(
           __hostsPath,
           '\n# fiddler-everywhere-enhance\n' +
             __missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') + '\n'
         )
+        __written = true
         console.info('[fe-patch] hosts patched')
       } catch (e) {
-        console.error('[fe-patch] hosts patch failed (needs root); add manually: ' + __missing.join(', '))
+        console.error('[fe-patch] hosts not writable, run install-hosts.cmd once: ' + __missing.join(', '))
+      }
+
+      if (!__written) {
+        try {
+          __feElectron.dialog.showMessageBoxSync({
+            type: 'warning',
+            title: 'Fiddler Everywhere patch',
+            message: 'The local API host entries are missing.',
+            detail:
+              'Sign in and the main window require these entries in the system hosts file:\n\n' +
+              __missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') +
+              '\n\nRight-click install-hosts.cmd in the application folder, choose ' +
+              '"Run as administrator", then restart Fiddler Everywhere.',
+            buttons: ['OK'],
+          })
+        } catch (e) { /* dialogs may be unavailable during startup */ }
       }
     }
   } catch (e) {

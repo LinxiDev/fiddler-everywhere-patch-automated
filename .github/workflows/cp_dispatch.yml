@@ -364,7 +364,7 @@ jobs:
             } elseif ($env:ARCH_CODE -eq "arm64") {
               $downloadUrl = "https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%20$patchingVersion.dmg"
             } elseif ($env:ARCH_CODE -eq "arm64e") {
-              //Don't know
+              throw "Unsupported OS architecture: $env:ARCH_CODE"
             } else {
               throw "Unsupported OS architecture: $env:ARCH_CODE"
             }
@@ -788,7 +788,7 @@ jobs:
           if ($main.Contains('[fe-patch]')) { Write-Host "OK   runtime hooks present" }
           else { $failures.Add("runtime hooks not found in main.js") }
 
-          if (startsWith(env.PATCH_LANGUAGE, 'Yes')) {
+          if ($env:PATCH_LANGUAGE -and $env:PATCH_LANGUAGE.StartsWith('Yes')) {
             Assert-Path "$out/translate.js" "translate.js (Chinese UI)"
           }
 
@@ -825,6 +825,19 @@ jobs:
             throw "Artifact verification failed with $($failures.Count) problem(s)"
           }
           Write-Host "All patch checks passed"
+
+      # The app cannot request elevation by itself without popping up UAC and a
+      # console window on every launch, so ship the one-time helpers instead.
+      - name: Ship hosts helper scripts
+        run: |
+          foreach ($helper in @('install-hosts.cmd', 'remove-hosts.cmd')) {
+            $source = "utils/inject/$helper"
+            if (-not (Test-Path $source)) {
+              throw "Helper script not found: $source"
+            }
+            Copy-Item -Path $source -Destination "FE/$helper" -Force
+            Write-Host "Shipped $helper to the artifact root"
+          }
 
       - name: Rename FE 
         id: rename-fe
