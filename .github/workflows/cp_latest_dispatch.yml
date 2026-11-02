@@ -552,37 +552,23 @@ jobs:
             throw "Could not find the port declaration in $source_index"
           }
 
-          # FE 8.x rewrites the UI endpoints to http://api.getfiddler.be:<port>
-          # and http://identity.getfiddler.be:<port>. Those hostnames resolve to
-          # real CloudFront addresses, so without a redirect the requests leave
-          # the machine and the UI stays on the loading screen. Upstream solves
-          # this by editing the system hosts file; Chromium's host resolver rules
-          # achieve the same thing without administrator rights.
-          $host_routing = @(
-            '',
-            '// ---- injected: resolve .be API hosts to the local server without touching system hosts ----',
-            'try {',
-            '  const { app: __feApp } = require("electron")',
-            '  const __feHostRules = "MAP api.getfiddler.be 127.0.0.1, MAP identity.getfiddler.be 127.0.0.1"',
-            '  if (__feApp && typeof __feApp.commandLine?.appendSwitch === "function") {',
-            '    __feApp.commandLine.appendSwitch("host-resolver-rules", __feHostRules)',
-            '    console.info("host-resolver-rules applied:", __feHostRules)',
-            '  }',
-            '} catch (e) { console.error("host-resolver-rules failed:", e) }'
-          )
+          # Runtime hooks keep the app self-contained: they redirect the .be API
+          # hosts (both renderer and .NET backend) and bypass the hardcoded ECDSA
+          # public key whitelist of the Angular bundle. See the file for details.
+          $hooks_path = "utils/inject/runtime-hooks.js"
+          if (-not (Test-Path $hooks_path)) {
+            throw "Runtime hooks not found: $hooks_path"
+          }
+          $hooks = (Get-Content -Path $hooks_path -Raw) -split "\r?\n"
 
           $output = New-Object System.Collections.Generic.List[string]
           $port_written = $false
-          $routing_written = $false
 
           foreach ($line in $lines) {
             if (-not $port_written -and $line -match '^const port = \d+;$') {
               $output.Add("const port = $env:PATCH_SERVER_PORT;")
               $port_written = $true
-              if (-not $routing_written) {
-                foreach ($injected in $host_routing) { $output.Add($injected) }
-                $routing_written = $true
-              }
+              foreach ($hook_line in $hooks) { $output.Add($hook_line) }
               continue
             }
             $output.Add($line)
@@ -590,7 +576,7 @@ jobs:
 
           Set-Content -Path $source_index -Value $output -Encoding utf8NoBOM
           Write-Host "Server port set to $env:PATCH_SERVER_PORT"
-          Write-Host "Injected host-resolver-rules for api/identity .be domains"
+          Write-Host "Injected runtime hooks from $hooks_path"
 
       - name: Set user credentials
         run: |
