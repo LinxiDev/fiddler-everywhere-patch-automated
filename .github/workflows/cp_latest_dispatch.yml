@@ -390,6 +390,9 @@ jobs:
       patched-fe-name: ${{ steps.rename-fe.outputs.patched-fe-name }}
       
     steps:
+      - name: Checkout repository scripts
+        uses: actions/checkout@v6
+
       - name: Download Yukuhana-Patch
         uses: actions/download-artifact@v8
         with:
@@ -437,16 +440,65 @@ jobs:
             Write-Host "Yui-patch Folder not found"
           }
 
+      # FE 8.x ships the app as resources/app.asar instead of resources/app.
+      # It has to be extracted (and the archive removed) before main.js and the
+      # fake API file tree can be patched.
+      - name: Prepare Electron app directory
+        run: |
+          $resources = "FE/resources"
+          $appAsar = Join-Path $resources "app.asar"
+          $appDir = Join-Path $resources "app"
+          $unpackedDir = Join-Path $resources "app.asar.unpacked"
+
+          if (Test-Path $appAsar) {
+            # The asar header lists NOTICES-reporter.txt as unpacked, but some
+            # installers do not ship it. @electron/asar fails with ENOENT while
+            # extracting unless the placeholder exists.
+            if (Test-Path $unpackedDir) {
+              $notices = Join-Path $unpackedDir "NOTICES-reporter.txt"
+              if (-not (Test-Path $notices)) {
+                New-Item -ItemType File -Path $notices -Force | Out-Null
+                Write-Host "Created missing $notices"
+              }
+            }
+
+            Write-Host "resources/app.asar found; extracting to resources/app (FE 8.x layout)"
+            if (Test-Path $appDir) {
+              Remove-Item -Path $appDir -Recurse -Force
+            }
+            npx --yes @electron/asar extract $appAsar $appDir
+            if (-not (Test-Path (Join-Path $appDir "out/main.js"))) {
+              throw "app.asar extraction failed: resources/app/out/main.js not found"
+            }
+            # Electron prefers app.asar over app/, so remove the archive to make
+            # the extracted (and patched) resources/app take effect.
+            Remove-Item -Path $appAsar -Force
+            Write-Host "app.asar extracted and removed"
+          } elseif (Test-Path (Join-Path $appDir "out/main.js")) {
+            Write-Host "resources/app already exists (FE < 8.x layout); skipping extraction"
+          } else {
+            throw "Neither resources/app.asar nor resources/app/out/main.js was found"
+          }
+
       - name: Copy Server Folder
         run: |
           $source_server_folder = "msojocs-patch/server/file"
           $destination_server_folder = "FE/resources/app/out"
+          $target_server_folder = Join-Path $destination_server_folder "file"
 
-          if (Test-Path $source_server_folder) {
-            Copy-Item -Path $source_server_folder -Destination $destination_server_folder -Recurse
-          } else {
-            Write-Host "Source Server Folder not found"
+          if (-not (Test-Path $source_server_folder)) {
+            throw "Source server folder not found: $source_server_folder"
           }
+          if (-not (Test-Path $destination_server_folder)) {
+            throw "FE app directory not found: $destination_server_folder"
+          }
+
+          # Remove first: Copy-Item would otherwise nest file/ inside file/.
+          if (Test-Path $target_server_folder) {
+            Remove-Item -LiteralPath $target_server_folder -Recurse -Force
+          }
+          Copy-Item -Path $source_server_folder -Destination $destination_server_folder -Recurse
+          Write-Host "Copied $source_server_folder to $target_server_folder"
 
       - name: Enable Chinese translation
         if: startsWith(env.PATCH_LANGUAGE, 'Yes')
@@ -464,19 +516,28 @@ jobs:
       - name: Set patch server port (in main.js of server)
         run: |
           $source_index = "msojocs-patch/server/index.js"
-          $index_content = Get-Content -Path $source_index -Raw
 
-          if (Test-Path $source_index) {
-            $index_content = $index_content -replace 'const port = \d+;', "const port = $env:PATCH_SERVER_PORT;"
-            Set-Content -Path $source_index -Value $index_content
-            Write-Host "Server port set to $env:PATCH_SERVER_PORT"
-          } else {
-            Write-Host "index.js (from server) not found"
+          if (-not (Test-Path $source_index)) {
+            throw "server/index.js not found: $source_index"
           }
+
+          $index_content = Get-Content -Path $source_index -Raw
+          $port_pattern = 'const port = \d+;'
+          if (-not [regex]::IsMatch($index_content, $port_pattern)) {
+            throw "Could not find the port declaration in $source_index"
+          }
+          $index_content = $index_content -replace $port_pattern, "const port = $env:PATCH_SERVER_PORT;"
+          Set-Content -Path $source_index -Value $index_content
+          Write-Host "Server port set to $env:PATCH_SERVER_PORT"
 
       - name: Set user credentials
         run: |
           $source_json = "FE/resources/app/out/file/identity.getfiddler.com/oauth/token.json"
+
+          if (-not (Test-Path $source_json)) {
+            throw "User credential template not found: $source_json"
+          }
+
           $main_content = Get-Content -Path $source_json -Raw | ConvertFrom-Json
 
           $main_content.user_info.email = $env:PATCH_USER_EMAIL
@@ -490,22 +551,40 @@ jobs:
       - name: Patch main.js to main.original.js
         run: |
           $source_main = "FE/resources/app/out/main.js"
-          $main_content = Get-Content -Path $source_main -Raw
-
           $new_main = "FE/resources/app/out/main.original.js"
-
           $source_index = "msojocs-patch/server/index.js"
-          $index_content = Get-Content -Path $source_index -Raw
-          
-          if ((Test-Path $source_main) -and (Test-Path $source_index)) {
-            Copy-Item -Path $source_main -Destination $new_main
 
-            $appended_content = $index_content + $main_content
-
-            Set-Content -Path $source_main -Value $appended_content
-          } else {
-            Write-Host "Source main.js or index.js (from server) not found"
+          if (-not (Test-Path $source_main)) {
+            throw "FE main.js not found: $source_main"
           }
+          if (-not (Test-Path $source_index)) {
+            throw "server/index.js not found: $source_index"
+          }
+
+          $main_content = Get-Content -Path $source_main -Raw
+          $index_content = Get-Content -Path $source_index -Raw
+
+          Copy-Item -Path $source_main -Destination $new_main -Force
+          Set-Content -Path $source_main -Value ($index_content + $main_content)
+          Write-Host "Prepended server/index.js to $source_main"
+
+      # FE 8.x verifies that app.asar is still present. Since the archive is
+      # extracted and removed above, the backend checks must be neutralised.
+      - name: Patch FE 8.x WebUi checks
+        run: |
+          $patchingVersion = $env:SCRAPED_VERSION
+          if ([string]::IsNullOrEmpty($patchingVersion) -or [version]$patchingVersion -lt [version]"8.0.0") {
+            Write-Host "FE version $patchingVersion is below 8.0.0; skipping WebUi integrity patch"
+            exit 0
+          }
+
+          $dll = "FE/resources/app/out/WebServer/Fiddler.WebUi.dll"
+          if (-not (Test-Path $dll)) {
+            throw "Fiddler.WebUi.dll not found at $dll"
+          }
+
+          python -m pip install --disable-pip-version-check --no-input dnfile
+          python "utils/patch_integrity_check.py" $dll
 
       - name: Clean msojocs-patch
         run: |
