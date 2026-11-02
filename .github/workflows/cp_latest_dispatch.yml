@@ -611,6 +611,61 @@ jobs:
           python -m pip install --disable-pip-version-check --no-input dnfile
           python "utils/patch_integrity_check.py" $dll
 
+      # FE 8.x validates the ECDSA public key of every signed API response
+      # against a built-in whitelist (FiddlerBackendSDK -> Enumerable.Any).
+      # The local server signs responses with a runtime generated key, so the
+      # whitelist check must be neutralised, otherwise the UI keeps waiting on
+      # the configuration/user endpoints.
+      - name: Patch FE 8.x response signature check (System.Linq.dll)
+        run: |
+          $patchingVersion = $env:SCRAPED_VERSION
+          if ([string]::IsNullOrEmpty($patchingVersion) -or [version]$patchingVersion -lt [version]"8.0.0") {
+            Write-Host "FE version $patchingVersion is below 8.0.0; skipping signature check patch"
+            exit 0
+          }
+
+          $target = "FE/resources/app/out/WebServer/System.Linq.dll"
+          if (-not (Test-Path $target)) {
+            Write-Host "System.Linq.dll not found at $target; skipping signature check patch"
+            exit 0
+          }
+
+          $url = "https://github.com/msojocs/dotnet-runtime-for-fildder/releases/download/v10.0.9-1/System.Linq.dll"
+          $download = "System.Linq.dll.patched"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $download
+
+          if ((Get-Item $download).Length -lt 100000) {
+            throw "Downloaded System.Linq.dll looks truncated: $((Get-Item $download).Length) bytes"
+          }
+
+          Copy-Item -Path $download -Destination $target -Force
+          Remove-Item -Path $download -Force
+          Write-Host "Replaced $target with the public key whitelist patched build"
+
+      - name: Ensure backend binary is executable (Linux)
+        if: env.OS_ARCH == 'Linux (x86_64)'
+        run: |
+          $backend = "FE/resources/app/out/WebServer/Fiddler.WebUi"
+          if (-not (Test-Path $backend)) {
+            Write-Host "$backend not found; skipping"
+            exit 0
+          }
+
+          try {
+            $mode = [System.IO.UnixFileMode]::UserRead -bor
+                    [System.IO.UnixFileMode]::UserWrite -bor
+                    [System.IO.UnixFileMode]::UserExecute -bor
+                    [System.IO.UnixFileMode]::GroupRead -bor
+                    [System.IO.UnixFileMode]::GroupExecute -bor
+                    [System.IO.UnixFileMode]::OtherRead -bor
+                    [System.IO.UnixFileMode]::OtherExecute
+            [System.IO.File]::SetUnixFileMode($backend, $mode)
+            Write-Host "Marked $backend as executable"
+          } catch {
+            Write-Host "Unable to set Unix file mode: $_"
+          }
+
       - name: Clean msojocs-patch
         run: |
           if (Test-Path msojocs-patch) {
