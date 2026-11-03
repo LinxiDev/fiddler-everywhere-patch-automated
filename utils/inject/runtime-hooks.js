@@ -146,26 +146,90 @@
   }
 
   // ------------------------------------------------------------ server tracing --
+  //
+  // The local API server is created by the injected server/index.js. Three
+  // additions here, all of which a stuck sign-in depends on:
+  //
+  //  * CORS. The mock server sends no Access-Control-* headers at all. The
+  //    renderer runs from a file:// origin, so a stricter Chromium build (or a
+  //    proxy in front of it) rejects the response and the app reports
+  //    "0 Unknown Error" / "Failed to fetch" instead of anything useful.
+  //  * Private Network Access. Chromium blocks requests from a public origin to
+  //    loopback unless the response opts in.
+  //  * Visibility. A failed bind (the usual EADDRINUSE on 5678) previously left
+  //    no trace anywhere, which looks exactly like a network outage.
   try {
     var http = require('http')
     var originalCreateServer = http.createServer
-    http.createServer = function () {
-      var server = originalCreateServer.apply(this, arguments)
-      server.on('request', function (req, res) {
-        var target = req.method + ' ' + (req.headers.host || '') + (req.url || '')
-        var originalEnd = res.end
-        res.end = function (chunk) {
+
+    http.createServer = function (handler) {
+      var args = [].slice.call(arguments)
+
+      if (typeof handler === 'function') {
+        args[0] = function (req, res) {
+          var target = req.method + ' ' + (req.headers.host || '') + (req.url || '')
+
           try {
-            // Only the mock server replies with this literal string. Legitimate
-            // non JSON answers (the OAuth HTML pages, favicon, or the app's own
-            // callback listener) must not be reported.
-            if (chunk && String(chunk) === 'not implement') {
-              log('[endpoint-miss] ' + target)
-            }
-          } catch (e) { /* ignore */ }
-          return originalEnd.apply(this, arguments)
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
+            res.setHeader('Access-Control-Allow-Headers', '*')
+            res.setHeader('Access-Control-Expose-Headers', '*')
+            res.setHeader('Access-Control-Allow-Private-Network', 'true')
+            res.setHeader('Access-Control-Max-Age', '600')
+          } catch (e) { /* headers may already be sent */ }
+
+          // Answer preflight directly; the mock handler only knows GET/POST.
+          if (req.method === 'OPTIONS') {
+            log('[cors] preflight ' + target)
+            res.statusCode = 204
+            res.end()
+            return
+          }
+
+          var originalEnd = res.end
+          res.end = function (chunk) {
+            try {
+              // Only the mock server replies with this literal string.
+              if (chunk && String(chunk) === 'not implement') {
+                log('[endpoint-miss] ' + target)
+              }
+            } catch (e) { /* ignore */ }
+            return originalEnd.apply(this, arguments)
+          }
+
+          return handler.call(this, req, res)
+        }
+      }
+
+      var server = originalCreateServer.apply(this, args)
+
+      server.on('listening', function () {
+        try {
+          var addr = server.address()
+          log('[server] listening on ' + (addr && addr.address) + ':' + (addr && addr.port))
+        } catch (e) { /* ignore */ }
+      })
+
+      server.on('error', function (err) {
+        var code = (err && err.code) || 'unknown'
+        log('[server:error] ' + code + ' ' + (err && err.message))
+        if (code === 'EADDRINUSE') {
+          log('[server:error] the local API port is already in use; every ' +
+              'api.getfiddler.* request will fail with status 0')
+          try {
+            electron.dialog.showErrorBox(
+              'Fiddler Everywhere patch - port already in use',
+              'The local API server could not start because the port is already in use.\n\n' +
+              (err && err.message ? err.message + '\n\n' : '') +
+              'Close other Fiddler Everywhere instances (or the application using ' +
+              'this port), then start the app again.\n\n' +
+              'Tip: use a different port by running the workflow with another ' +
+              '"patch-server-port" value.'
+            )
+          } catch (e) { /* dialogs may be unavailable */ }
         }
       })
+
       return server
     }
   } catch (e) {
