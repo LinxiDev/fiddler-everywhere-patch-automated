@@ -145,6 +145,51 @@
     log('hosts check scheduling failed: ' + e)
   }
 
+  // ------------------------------------------------------------------- resolver --
+  //
+  // The hosts file being correct is not the same thing as the OS resolver
+  // returning loopback for these names. The .NET backend uses the operating
+  // system resolver, so verify what it will actually get and log it either way.
+  //
+  // Also log proxy related environment variables: a system or environment proxy
+  // makes the backend send its API calls elsewhere and the sign-in then hangs
+  // until the 100 second HttpClient timeout, with no server-side trace.
+  function verifyResolution() {
+    var dns = require('dns')
+    HOSTS_DOMAINS.forEach(function (domain) {
+      try {
+        dns.lookup(domain, { all: true }, function (err, addresses) {
+          if (err) {
+            log('[dns] ' + domain + ' -> ERROR ' + err.code)
+            return
+          }
+          var list = (addresses || []).map(function (a) { return a.address }).join(', ')
+          var local = (addresses || []).some(function (a) {
+            return a.address === '127.0.0.1' || a.address === '::1'
+          })
+          log('[dns] ' + domain + ' -> ' + list + (local ? ' (loopback ok)' : ' (NOT loopback)'))
+        })
+      } catch (e) {
+        log('[dns] ' + domain + ' -> lookup failed ' + e)
+      }
+    })
+
+    ;['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+      'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'].forEach(function (name) {
+      if (process.env[name]) {
+        log('[proxy] ' + name + '=' + process.env[name])
+      }
+    })
+  }
+
+  try {
+    app.whenReady().then(verifyResolution).catch(function (e) {
+      log('resolver check failed: ' + e)
+    })
+  } catch (e) {
+    log('resolver check scheduling failed: ' + e)
+  }
+
   // ------------------------------------------------------------ server tracing --
   //
   // The local API server is created by the injected server/index.js. Three
@@ -189,10 +234,22 @@
           var originalEnd = res.end
           res.end = function (chunk) {
             try {
+              var body = chunk ? String(chunk) : ''
+
               // Only the mock server replies with this literal string.
-              if (chunk && String(chunk) === 'not implement') {
+              if (body === 'not implement') {
                 log('[endpoint-miss] ' + target)
               }
+
+              // Record every exchange, including the successful ones. A hung
+              // sign-in is otherwise indistinguishable from a request that
+              // never reached this server at all.
+              var signed = !!(res.getHeader && res.getHeader('signature'))
+              log(
+                '[req] ' + target + ' -> ' + res.statusCode +
+                (signed ? ' signed' : ' unsigned') +
+                ' ' + body.length + 'B'
+              )
             } catch (e) { /* ignore */ }
             return originalEnd.apply(this, arguments)
           }
