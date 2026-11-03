@@ -82,14 +82,9 @@
     })
   }
 
-  function ensureHostsEntries() {
-    var missing = missingHostsEntries()
-    if (!missing.length) {
-      log('hosts entries present')
-      return
-    }
-
-    // Direct write only works when the process is already elevated.
+  // Writes the entries with the rights the current process already has. Returns
+  // true on success.
+  function appendHostsEntries(missing) {
     try {
       require('fs').appendFileSync(
         hostsPath,
@@ -97,43 +92,116 @@
           missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') + '\n'
       )
       log('hosts patched automatically')
+      return true
+    } catch (e) {
+      log('hosts not writable directly: ' + missing.join(', '))
+      return false
+    }
+  }
+
+  // One time elevated write. Runs asynchronously so the main process (which also
+  // hosts the local API server) keeps serving requests, and without a visible
+  // console window.
+  function appendHostsEntriesElevated(missing, done) {
+    if (process.platform !== 'win32') {
+      done(false)
       return
-    } catch (e) {
-      log('hosts not writable: ' + missing.join(', '))
     }
 
-    var detail =
-      'Without these entries the Fiddler backend cannot sign in and the ' +
-      'application stays on the loading screen forever.\n\n' +
-      'Add the following lines to ' + hostsPath + ' :\n\n' +
-      missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') +
-      '\n\nEasiest: right-click install-hosts.cmd in the application folder, ' +
-      'choose "Run as administrator", then start Fiddler Everywhere again.'
+    var scriptPath = require('path').join(require('os').tmpdir(), 'fe-patch-hosts.ps1')
+    var lines = missing.map(function (domain) { return "'127.0.0.1 " + domain + "'" })
+    var content =
+      "$ErrorActionPreference='Stop'\r\n" +
+      "Add-Content -LiteralPath '" + hostsPath + "' -Encoding ascii -Value (" +
+      "[Environment]::NewLine + '# fiddler-everywhere-enhance' + " +
+      lines.join(' + [Environment]::NewLine + ') +
+      " + [Environment]::NewLine)\r\n"
 
-    var choice = 1
     try {
-      choice = electron.dialog.showMessageBoxSync({
-        type: 'warning',
-        title: 'Fiddler Everywhere patch - hosts entries required',
-        message: 'The hosts entries for the local API server are missing.',
-        detail: detail,
-        buttons: ['Quit and install hosts', 'Continue anyway'],
-        defaultId: 0,
-        cancelId: 0,
-      })
+      require('fs').writeFileSync(scriptPath, content, 'utf8')
     } catch (e) {
-      log('unable to show hosts dialog: ' + e)
-      choice = 1
+      log('unable to write hosts helper script: ' + e)
+      done(false)
+      return
     }
 
-    if (choice === 0) {
-      log('quitting: hosts entries are required')
-      try {
-        app.quit()
-      } catch (e) { /* ignore */ }
-    } else {
-      log('continuing without hosts entries; login will fail')
+    try {
+      var child = require('child_process').execFile(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command',
+          "Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait " +
+          "-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + scriptPath + "')"],
+        { windowsHide: true },
+        function (err) {
+          if (err) {
+            log('elevated hosts write failed: ' + (err.message || err))
+            done(false)
+            return
+          }
+          log('hosts patched with elevated rights')
+          done(true)
+        }
+      )
+      if (child && child.on) {
+        child.on('error', function (err) {
+          log('elevated hosts write could not start: ' + (err && err.message))
+        })
+      }
+    } catch (e) {
+      log('elevated hosts write threw: ' + e)
+      done(false)
     }
+  }
+
+  function ensureHostsEntries() {
+    var missing = missingHostsEntries()
+    if (!missing.length) {
+      log('hosts entries present')
+      return Promise.resolve()
+    }
+
+    if (appendHostsEntries(missing)) {
+      return Promise.resolve()
+    }
+
+    // Ask once, then guide the user. Everything here is asynchronous: a modal
+    // dialog on the main process would block the local API server and make the
+    // UI appear frozen.
+    return new Promise(function (resolve) {
+      var question = electron.dialog.showMessageBox({
+        type: 'question',
+        title: 'Fiddler Everywhere patch',
+        message: 'Grant administrator rights to finish setup?',
+        detail:
+          'Signing in requires these lines in ' + hostsPath + ' :\n\n' +
+          missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') +
+          '\n\nYes: a Windows administrator prompt appears once, then setup is complete.\n' +
+          'No: add them manually by right-clicking install-hosts.cmd and choosing ' +
+          '"Run as administrator".',
+        buttons: ['Yes, grant once', 'No, I will do it manually'],
+        defaultId: 0,
+        cancelId: 1,
+      })
+
+      question.then(function (result) {
+        if (result.response !== 0) {
+          log('hosts not installed; run install-hosts.cmd before signing in')
+          resolve()
+          return
+        }
+        appendHostsEntriesElevated(missing, function (ok) {
+          if (ok && !missingHostsEntries().length) {
+            log('hosts entries are in place; sign in will work')
+          } else {
+            log('hosts still missing; sign in will fail until install-hosts.cmd is run')
+          }
+          resolve()
+        })
+      }).catch(function (e) {
+        log('hosts dialog failed: ' + e)
+        resolve()
+      })
+    })
   }
 
   // Dialogs need the app to be ready, so run the check there rather than inline.
@@ -173,15 +241,20 @@
       }).join('\n')
 
       log('[dns:error] resolver does not return loopback for: ' + list)
+      // Asynchronous on purpose: a modal dialog on the main process also blocks
+      // the local API server that lives on the same event loop.
       try {
-        electron.dialog.showErrorBox(
-          'Fiddler Everywhere patch - DNS cache',
-          'These names still resolve to a public address:\n\n' + list + '\n\n' +
-          'The hosts file looks correct, so the resolver cache is probably stale.\n\n' +
-          'Run this in an administrator command prompt, then start the app again:\n\n' +
-          '    ipconfig /flushdns\n\n' +
-          'Verify with:  ping api.getfiddler.be   (must answer from 127.0.0.1)'
-        )
+        electron.dialog.showMessageBox({
+          type: 'warning',
+          title: 'Fiddler Everywhere patch - DNS cache',
+          message: 'These names still resolve to a public address.',
+          detail: list + '\n\n' +
+            'The hosts file looks correct, so the resolver cache is probably stale.\n\n' +
+            'Run this in an administrator command prompt, then start the app again:\n\n' +
+            '    ipconfig /flushdns\n\n' +
+            'Verify with:  ping api.getfiddler.be   (must answer from 127.0.0.1)',
+          buttons: ['OK'],
+        }).catch(function () { /* ignore */ })
       } catch (e) { /* dialogs may be unavailable */ }
     }
 
@@ -311,15 +384,18 @@
           log('[server:error] the local API port is already in use; every ' +
               'api.getfiddler.* request will fail with status 0')
           try {
-            electron.dialog.showErrorBox(
-              'Fiddler Everywhere patch - port already in use',
-              'The local API server could not start because the port is already in use.\n\n' +
-              (err && err.message ? err.message + '\n\n' : '') +
-              'Close other Fiddler Everywhere instances (or the application using ' +
-              'this port), then start the app again.\n\n' +
-              'Tip: use a different port by running the workflow with another ' +
-              '"patch-server-port" value.'
-            )
+            electron.dialog.showMessageBox({
+              type: 'error',
+              title: 'Fiddler Everywhere patch - port already in use',
+              message: 'The local API server could not start because the port is already in use.',
+              detail:
+                (err && err.message ? err.message + '\n\n' : '') +
+                'Close other Fiddler Everywhere instances (or the application using ' +
+                'this port), then start the app again.\n\n' +
+                'Tip: use a different port by running the workflow with another ' +
+                '"patch-server-port" value.',
+              buttons: ['OK'],
+            }).catch(function () { /* ignore */ })
           } catch (e) { /* dialogs may be unavailable */ }
         }
       })
