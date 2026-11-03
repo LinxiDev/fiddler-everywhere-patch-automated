@@ -842,7 +842,7 @@ jobs:
       # console window on every launch, so ship the one-time helpers instead.
       - name: Ship hosts helper scripts
         run: |
-          foreach ($helper in @('install-hosts.cmd', 'remove-hosts.cmd')) {
+          foreach ($helper in @('安装Hosts.bat', '卸载Hosts.bat')) {
             $source = "utils/inject/$helper"
             if (-not (Test-Path $source)) {
               throw "Helper script not found: $source"

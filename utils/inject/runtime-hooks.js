@@ -99,60 +99,10 @@
     }
   }
 
-  // One time elevated write. Runs asynchronously so the main process (which also
-  // hosts the local API server) keeps serving requests, and without a visible
-  // console window.
-  function appendHostsEntriesElevated(missing, done) {
-    if (process.platform !== 'win32') {
-      done(false)
-      return
-    }
-
-    var scriptPath = require('path').join(require('os').tmpdir(), 'fe-patch-hosts.ps1')
-    var lines = missing.map(function (domain) { return "'127.0.0.1 " + domain + "'" })
-    var content =
-      "$ErrorActionPreference='Stop'\r\n" +
-      "Add-Content -LiteralPath '" + hostsPath + "' -Encoding ascii -Value (" +
-      "[Environment]::NewLine + '# fiddler-everywhere-enhance' + " +
-      lines.join(' + [Environment]::NewLine + ') +
-      " + [Environment]::NewLine)\r\n"
-
-    try {
-      require('fs').writeFileSync(scriptPath, content, 'utf8')
-    } catch (e) {
-      log('unable to write hosts helper script: ' + e)
-      done(false)
-      return
-    }
-
-    try {
-      var child = require('child_process').execFile(
-        'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command',
-          "Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait " +
-          "-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + scriptPath + "')"],
-        { windowsHide: true },
-        function (err) {
-          if (err) {
-            log('elevated hosts write failed: ' + (err.message || err))
-            done(false)
-            return
-          }
-          log('hosts patched with elevated rights')
-          done(true)
-        }
-      )
-      if (child && child.on) {
-        child.on('error', function (err) {
-          log('elevated hosts write could not start: ' + (err && err.message))
-        })
-      }
-    } catch (e) {
-      log('elevated hosts write threw: ' + e)
-      done(false)
-    }
-  }
-
+  // The hosts file is managed by the 安装Hosts.bat / 卸载Hosts.bat helpers
+  // shipped next to the executable. The app never asks for elevation:
+  // requesting it from inside the process needs a UAC prompt, and any modal
+  // dialog blocks the event loop that also serves the local API.
   function ensureHostsEntries() {
     var missing = missingHostsEntries()
     if (!missing.length) {
@@ -160,47 +110,31 @@
       return Promise.resolve()
     }
 
+    // Only write when the process already has the rights. A normal launch never
+    // does, so this succeeds only when the user started the app elevated.
     if (appendHostsEntries(missing)) {
       return Promise.resolve()
     }
 
-    // Ask once, then guide the user. Everything here is asynchronous: a modal
-    // dialog on the main process would block the local API server and make the
-    // UI appear frozen.
+    log('hosts entries missing; run 安装Hosts.bat as administrator: ' +
+        missing.join(', '))
+
     return new Promise(function (resolve) {
-      var question = electron.dialog.showMessageBox({
-        type: 'question',
-        title: 'Fiddler Everywhere patch',
-        message: 'Grant administrator rights to finish setup?',
+      electron.dialog.showMessageBox({
+        type: 'warning',
+        title: 'Fiddler Everywhere patch - hosts entries required',
+        message: 'The hosts entries for the local API server are missing.',
         detail:
           'Signing in requires these lines in ' + hostsPath + ' :\n\n' +
           missing.map(function (domain) { return '127.0.0.1 ' + domain }).join('\n') +
-          '\n\nYes: a Windows administrator prompt appears once, then setup is complete.\n' +
-          'No: add them manually by right-clicking install-hosts.cmd and choosing ' +
-          '"Run as administrator".',
-        buttons: ['Yes, grant once', 'No, I will do it manually'],
-        defaultId: 0,
-        cancelId: 1,
-      })
-
-      question.then(function (result) {
-        if (result.response !== 0) {
-          log('hosts not installed; run install-hosts.cmd before signing in')
-          resolve()
-          return
-        }
-        appendHostsEntriesElevated(missing, function (ok) {
-          if (ok && !missingHostsEntries().length) {
-            log('hosts entries are in place; sign in will work')
-          } else {
-            log('hosts still missing; sign in will fail until install-hosts.cmd is run')
-          }
+          '\n\nRight-click 安装Hosts.bat in the application folder, choose ' +
+          '"Run as administrator", then start Fiddler Everywhere again.',
+        buttons: ['OK'],
+      }).then(function () { resolve() })
+        .catch(function (e) {
+          log('hosts dialog failed: ' + e)
           resolve()
         })
-      }).catch(function (e) {
-        log('hosts dialog failed: ' + e)
-        resolve()
-      })
     })
   }
 
@@ -232,15 +166,23 @@
       if (pending > 0) return
       if (!notLoopback.length) return
 
-      // The hosts file looks correct but the resolver still returns a public
-      // address, so the .NET backend cannot reach the local server and its
-      // sign-in hangs until the 100 second HttpClient timeout. The usual cause
-      // is a stale resolver cache: flush it and start over.
       var list = notLoopback.map(function (item) {
         return item.domain + ' -> ' + item.addresses
       }).join('\n')
 
       log('[dns:error] resolver does not return loopback for: ' + list)
+
+      // If the hosts entries are missing, that is the real cause and the hosts
+      // dialog already explains it. Only a stale cache is worth its own dialog.
+      if (missingHostsEntries().length) {
+        log('[dns:error] hosts entries are missing; see the hosts hint above')
+        return
+      }
+
+      // The hosts file looks correct but the resolver still returns a public
+      // address, so the .NET backend cannot reach the local server and its
+      // sign-in hangs until the 100 second HttpClient timeout. The usual cause
+      // is a stale resolver cache: flush it and start over.
       // Asynchronous on purpose: a modal dialog on the main process also blocks
       // the local API server that lives on the same event loop.
       try {

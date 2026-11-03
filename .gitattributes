@@ -1,0 +1,9 @@
+# Windows batch files must keep CRLF line endings, otherwise cmd.exe can fail
+# to parse them (labels and goto behave unpredictably with LF only).
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Keep the shipped JavaScript pristine.
+*.js    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
