@@ -156,11 +156,42 @@
   // until the 100 second HttpClient timeout, with no server-side trace.
   function verifyResolution() {
     var dns = require('dns')
+    var pending = HOSTS_DOMAINS.length
+    var notLoopback = []
+
+    function checkDone() {
+      pending -= 1
+      if (pending > 0) return
+      if (!notLoopback.length) return
+
+      // The hosts file looks correct but the resolver still returns a public
+      // address, so the .NET backend cannot reach the local server and its
+      // sign-in hangs until the 100 second HttpClient timeout. The usual cause
+      // is a stale resolver cache: flush it and start over.
+      var list = notLoopback.map(function (item) {
+        return item.domain + ' -> ' + item.addresses
+      }).join('\n')
+
+      log('[dns:error] resolver does not return loopback for: ' + list)
+      try {
+        electron.dialog.showErrorBox(
+          'Fiddler Everywhere patch - DNS cache',
+          'These names still resolve to a public address:\n\n' + list + '\n\n' +
+          'The hosts file looks correct, so the resolver cache is probably stale.\n\n' +
+          'Run this in an administrator command prompt, then start the app again:\n\n' +
+          '    ipconfig /flushdns\n\n' +
+          'Verify with:  ping api.getfiddler.be   (must answer from 127.0.0.1)'
+        )
+      } catch (e) { /* dialogs may be unavailable */ }
+    }
+
     HOSTS_DOMAINS.forEach(function (domain) {
       try {
         dns.lookup(domain, { all: true }, function (err, addresses) {
           if (err) {
             log('[dns] ' + domain + ' -> ERROR ' + err.code)
+            notLoopback.push({ domain: domain, addresses: 'lookup error ' + err.code })
+            checkDone()
             return
           }
           var list = (addresses || []).map(function (a) { return a.address }).join(', ')
@@ -168,9 +199,15 @@
             return a.address === '127.0.0.1' || a.address === '::1'
           })
           log('[dns] ' + domain + ' -> ' + list + (local ? ' (loopback ok)' : ' (NOT loopback)'))
+          if (!local) {
+            notLoopback.push({ domain: domain, addresses: list || '(empty)' })
+          }
+          checkDone()
         })
       } catch (e) {
         log('[dns] ' + domain + ' -> lookup failed ' + e)
+        notLoopback.push({ domain: domain, addresses: 'lookup failed' })
+        checkDone()
       }
     })
 
